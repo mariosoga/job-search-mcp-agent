@@ -25,6 +25,8 @@ of a frozen database snapshot:
 | Cost per run | $0.0042 | $0.0027 | $0.0027 |
 | Latency per run | 12.4 s | 8.6 s | 9.2 s |
 
+Each variant is 46 tasks × 3 runs = 138 graded runs, so 414 across baseline, v1 and v2.
+
 | Failure category | baseline | v1 | v2 |
 |---|---|---|---|
 | Mass action before confirming | 12 | 12 | **0** |
@@ -64,8 +66,10 @@ flowchart LR
     W --> D
 ```
 
-- **`server.py`** exposes 12 tools over MCP (official Python SDK 1.x, stdio). Read tools
-  use a read-only database connection. Results are capped at 100 rows and always report
+- **`server.py`** exposes 12 tools over MCP (official Python SDK 1.x, stdio). Every tool
+  has a typed JSON schema generated from its Python type hints; fixed value sets such as
+  status are enums the SDK enforces, so invalid arguments are rejected before any code
+  runs. Read tools use a read-only database connection. Results are capped at 100 rows and always report
   `total`, and bad input returns an error with suggestions (`did_you_mean`) instead of
   raising.
 - **`agent.py`** is the agent loop, written by hand rather than with a framework so every
