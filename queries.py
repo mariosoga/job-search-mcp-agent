@@ -23,6 +23,9 @@ MAX_LIMIT = 100
 
 STATUSES = ("applied", "responded", "assessment", "interviewing", "rejected", "closed")
 OUTREACH_STATUSES = ("messaged", "accepted", "replied", "asked_resume")
+EVENT_TYPES = ("screening_questions", "general_assessment", "coding_assessment",
+               "screening_interview", "coding_interview", "assessment",
+               "technical_interview", "recruiter_call", "position_closed")
 
 APP_COLUMNS = """a.id AS application_id, c.name AS company, a.title, a.req_id, a.location,
                  a.applied_date, a.source, a.status, a.rejected_date, a.days_to_rejection,
@@ -224,6 +227,54 @@ def find_stale_applications(min_days=21, require_accepted_contact=False, limit=2
                      params + [_limit(limit)])
     return {"as_of": now.isoformat(), "min_days": min_days, "total": total,
             "returned": len(rows), "applications": rows}
+
+
+def list_events(event_type=None, company=None, after=None, before=None, limit=50):
+    """Interview/assessment events, oldest first; undated events sort last.
+
+    A date filter cannot match an undated event, so those are counted in
+    `undated_excluded` instead of silently disappearing."""
+    if event_type is not None and event_type not in EVENT_TYPES:
+        return {"error": f"event_type must be one of {list(EVENT_TYPES)}, got {event_type!r}"}
+    after, err = _check_date(after, "after")
+    if err:
+        return err
+    before, err = _check_date(before, "before")
+    if err:
+        return err
+
+    with connect() as conn:
+        where, params = [], []
+        if company:
+            row, err = resolve_company(conn, company)
+            if err:
+                return err
+            where.append("e.company_id = ?")
+            params.append(row["id"])
+        if event_type:
+            where.append("e.type = ?")
+            params.append(event_type)
+        base = list(where)
+        if after:
+            where.append("e.event_date >= ?")
+            params.append(after)
+        if before:
+            where.append("e.event_date <= ?")
+            params.append(before)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        total = conn.execute(f"SELECT COUNT(*) FROM events e {clause}", params).fetchone()[0]
+        rows = _rows(conn, f"""SELECT e.type, e.event_date, c.name AS company, e.application_id,
+                                      a.title, e.details
+                               FROM events e JOIN companies c ON c.id = e.company_id
+                               LEFT JOIN applications a ON a.id = e.application_id {clause}
+                               ORDER BY e.event_date IS NULL, e.event_date, e.id LIMIT ?""",
+                     params + [_limit(limit)])
+        undated = 0
+        if after or before:
+            undated_clause = " AND ".join(base + ["e.event_date IS NULL"])
+            undated = conn.execute(f"SELECT COUNT(*) FROM events e WHERE {undated_clause}",
+                                   params[:len(base)]).fetchone()[0]
+    return {"total": total, "returned": len(rows), "undated_excluded": undated, "events": rows}
 
 
 def summarize_applications(group_by="status", limit=25):

@@ -1,0 +1,11 @@
+# personal data: never commit
+*.csv
+*.db
+traces/
+
+# secrets and local environment
+.env
+.venv/
+
+__pycache__/
+.DS_Store

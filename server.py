@@ -22,6 +22,9 @@ mcp = FastMCP("jobsearch")
 
 Status = Literal["applied", "responded", "assessment", "interviewing", "rejected", "closed"]
 OutreachStatus = Literal["messaged", "accepted", "replied", "asked_resume"]
+EventType = Literal["screening_questions", "general_assessment", "coding_assessment",
+                    "screening_interview", "coding_interview", "assessment",
+                    "technical_interview", "recruiter_call", "position_closed"]
 
 
 @mcp.tool()
@@ -97,6 +100,25 @@ def find_stale_applications(
     replied, or asked for my resume. Set require_accepted_contact=true to keep
     only companies where I have such a contact (good follow-up candidates)."""
     return queries.find_stale_applications(min_days, require_accepted_contact, limit)
+
+
+@mcp.tool()
+def list_events(
+    event_type: Optional[EventType] = None,
+    company: Optional[str] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    limit: int = 50,
+) -> dict:
+    """List interview and assessment events across all companies, oldest first.
+    Use this for "when" questions (e.g. "interviews in August"), not
+    search_applications: many events are not linked to any application, and an
+    application's status shows only its current stage.
+
+    after/before are ISO dates (YYYY-MM-DD), inclusive. Undated events never
+    match a date filter; `undated_excluded` counts how many were left out that
+    way. company may be a partial name. Capped at 100 rows; check `total`."""
+    return queries.list_events(event_type, company, after, before, limit)
 
 
 @mcp.tool()
