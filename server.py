@@ -1,5 +1,9 @@
 """
-Job-search MCP server (read-only, stdio transport).
+Job-search MCP server (stdio transport).
+
+Read tools use a read-only connection (queries.py). Write tools (writes.py) above
+"low" risk run only with an approval token in the request's _meta; without one
+they return {"approval_required": true, ...} and change nothing. See approval.py.
 
 Run by an MCP client, not by hand. To try it, run test_client.py.
 
@@ -10,9 +14,12 @@ import logging
 import sys
 from typing import Literal, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
+import approval
 import queries
+import writes
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -129,6 +136,73 @@ def summarize_applications(
     """Count applications grouped by status, source (where I found the job),
     company, or month applied. Use for overview questions, not for listing rows."""
     return queries.summarize_applications(group_by, limit)
+
+
+# --------------------------------------------------------------------------
+# write tools
+# --------------------------------------------------------------------------
+verifier = approval.Verifier()
+WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
+RISKY = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
+
+
+def _write(tool, arguments, ctx):
+    """Validate, enforce the approval gate, then apply. The gate lives here, on the
+    server, so no client (or buggy agent) can run a risky tool without approval."""
+    args, summary, err = writes.prepare(tool, arguments)
+    if err:
+        return err
+    if writes.needs_approval(tool):
+        meta = ctx.request_context.meta
+        token = getattr(meta, approval.META_FIELD, None) if meta else None
+        if token is None and verifier.key:
+            # The agent loop catches this, asks a person, and retries with a token.
+            return {"approval_required": True, "tool": tool, "arguments": args,
+                    "summary": summary}
+        reason = verifier.check(token, tool, args)
+        if reason:
+            log.warning("blocked %s: %s", tool, reason)
+            return {"error": f"Not approved: {reason}. Nothing was changed.", "blocked": True}
+    log.info("write %s %s", tool, args)
+    return writes.execute(tool, args)
+
+
+@mcp.tool(annotations=WRITE)
+def draft_followup(company: str, contact_name: str, subject: str, body: str,
+                   ctx: Context, application_id: Optional[int] = None) -> dict:
+    """Save a follow-up email draft to one recruiter contact. Sends nothing and
+    needs no approval. contact_name must be a contact recorded at that company
+    (see list_contacts); application_id optionally links the draft to an
+    application at the same company. Returns draft_id for send_email."""
+    return _write("draft_followup", {"company": company, "contact_name": contact_name,
+                                     "subject": subject, "body": body,
+                                     "application_id": application_id}, ctx)
+
+
+@mcp.tool(annotations=WRITE)
+def update_status(application_id: int, status: Status, ctx: Context,
+                  note: Optional[str] = None) -> dict:
+    """Change one application's status. Requires a person's approval, which the
+    agent asks for automatically. If it is declined, nothing changes: do not
+    retry the same action."""
+    return _write("update_status", {"application_id": application_id, "status": status,
+                                    "note": note}, ctx)
+
+
+@mcp.tool(annotations=RISKY)
+def send_email(draft_id: int, ctx: Context) -> dict:
+    """Send a saved draft (from draft_followup). Only writes it to a local outbox
+    file; no real email leaves the machine. Requires a person's approval. Never
+    call this when the user asked only for drafts."""
+    return _write("send_email", {"draft_id": draft_id}, ctx)
+
+
+@mcp.tool(annotations=RISKY)
+def delete_application(application_id: int, reason: str, ctx: Context) -> dict:
+    """Hide one application from all searches (soft delete; the row is kept).
+    Requires a person's approval. One application per call; there is no bulk delete."""
+    return _write("delete_application", {"application_id": application_id,
+                                         "reason": reason}, ctx)
 
 
 if __name__ == "__main__":

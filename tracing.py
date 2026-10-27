@@ -10,8 +10,9 @@ Every record has a "type":
   run_start   run id, task, model, effort, frozen date, system prompt, tool definitions
   model_call  step, stop reason, served model, full content blocks, usage, latency
   model_error step, API or network error, latency
+  approval    step, tool, the server's normalized arguments and summary, decision, decided_by
   tool_call   step, tool name, arguments, result text, is_error, latency
-  run_end     outcome, final answer, totals (steps, tool calls, tokens, cost, seconds)
+  run_end     outcome, final answer, totals (steps, tool calls, approvals, tokens, cost, seconds)
 
 Each record is flushed as soon as it is written, so a run that crashes still
 leaves everything up to the crash. traces/ holds personal data and is gitignored.
@@ -60,6 +61,7 @@ class Tracer:
         self.model = model
         self.started = time.monotonic()
         self.steps = self.tool_calls = self.tool_errors = 0
+        self.approvals = self.denied = 0
         self.tokens_in = self.tokens_out = 0
         self._write("run_start", task=task, model=model, effort=effort, as_of=as_of,
                     max_steps=max_steps, system=system, tools=tools,
@@ -83,6 +85,12 @@ class Tracer:
         self.steps = step
         self._write("model_error", step=step, error=error, latency_ms=round(latency_ms))
 
+    def approval(self, step, tool, arguments, summary, decision, decided_by):
+        self.approvals += 1
+        self.denied += decision != "approved"
+        self._write("approval", step=step, tool=tool, arguments=arguments, summary=summary,
+                    decision=decision, decided_by=decided_by)
+
     def tool_call(self, step, name, arguments, result, is_error, latency_ms):
         self.tool_calls += 1
         self.tool_errors += bool(is_error)
@@ -91,7 +99,8 @@ class Tracer:
 
     def end(self, outcome, answer):
         self.totals = {"steps": self.steps, "tool_calls": self.tool_calls,
-                       "tool_errors": self.tool_errors, "input_tokens": self.tokens_in,
+                       "tool_errors": self.tool_errors, "approvals": self.approvals,
+                       "denied": self.denied, "input_tokens": self.tokens_in,
                        "output_tokens": self.tokens_out,
                        "cost_usd": cost_usd(self.model, self.tokens_in, self.tokens_out),
                        "seconds": round(time.monotonic() - self.started, 1)}
@@ -105,9 +114,11 @@ class Tracer:
 
 def summary_line(run_id, outcome, t):
     cost = f"${t['cost_usd']:.4f}" if t.get("cost_usd") is not None else "$?"
+    approvals = (f", {t['approvals']} approvals ({t['denied']} denied)"
+                 if t.get("approvals") else "")
     return (f"{run_id}  {outcome:<11} {t['steps']} steps, {t['tool_calls']} tool calls"
-            f" ({t['tool_errors']} errors), {t['input_tokens']}+{t['output_tokens']} tokens,"
-            f" {cost}, {t['seconds']} s")
+            f" ({t['tool_errors']} errors){approvals}, {t['input_tokens']}+{t['output_tokens']}"
+            f" tokens, {cost}, {t['seconds']} s")
 
 
 # --------------------------------------------------------------------------
@@ -143,6 +154,9 @@ def show(path, full=False):
                     print(f"      fallback: {b}")
         elif r["type"] == "model_error":
             print(f"[{r['step']}] model -> ERROR {r['error']}  ({r['latency_ms']} ms)")
+        elif r["type"] == "approval":
+            print(f"    APPROVAL {r['decision'].upper()} ({r['decided_by']}): {r['tool']}")
+            print("      " + _clip(r["summary"].replace("\n", " "), 200, full))
         elif r["type"] == "tool_call":
             flag = "ERROR " if r["is_error"] else ""
             print(f"    {r['name']}({json.dumps(r['arguments'])})  {r['latency_ms']} ms")

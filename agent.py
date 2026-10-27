@@ -14,6 +14,10 @@ visible and can be traced later:
 
 Every run, failed ones included, writes a trace to traces/ (see tracing.py).
 
+Risky write tools pause for a person's yes/no (--approvals). On yes, the loop
+sends the server a one-time token for that exact action (see approval.py); on
+no, the model is told the action was declined.
+
 Needs ANTHROPIC_API_KEY, read from the environment or a gitignored .env file.
 """
 import argparse
@@ -30,6 +34,7 @@ from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+import approval
 from tracing import Tracer
 
 HERE = Path(__file__).parent
@@ -68,16 +73,55 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-async def call_tool(session, name, arguments):
+async def call_tool(session, name, arguments, meta=None):
     """Run one MCP tool call. Returns (result_text, is_error); never raises."""
     try:
-        result = await session.call_tool(name, arguments)
+        result = await session.call_tool(name, arguments, meta=meta)
     except Exception as e:  # server crashed or protocol error: still a result for the model
         return f"Tool call failed: {type(e).__name__}: {e}", True
     return tool_text(result), bool(result.isError)
 
 
-async def run_task(client, session, tools, task, model, effort, max_steps, as_of):
+def approval_request(text):
+    """The server's {"approval_required": true, ...} reply, or None."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and data.get("approval_required") is True else None
+
+
+async def ask_person(request, mode):
+    """Return (decision, decided_by). The model never sees this exchange."""
+    if mode == "approve":
+        return "approved", "auto"
+    if mode == "deny" or not sys.stdin.isatty():
+        return "denied", "auto"
+    log(f"\n  APPROVAL NEEDED: {request['tool']}\n  {request['summary']}\n"
+        f"  arguments: {json.dumps(request['arguments'], ensure_ascii=False)}")
+    print("  Approve? [y/N] ", end="", file=sys.stderr, flush=True)
+    answer = await asyncio.to_thread(sys.stdin.readline)
+    return ("approved" if answer.strip().lower() in ("y", "yes") else "denied"), "person"
+
+
+async def run_tool(session, tracer, step, name, arguments, approvals, key):
+    """Call a tool; if the server asks for approval, ask a person and retry with a token."""
+    text, is_error = await call_tool(session, name, arguments)
+    request = approval_request(text)
+    if not request:
+        return text, is_error
+    decision, by = await ask_person(request, approvals)
+    tracer.approval(step, name, request["arguments"], request["summary"], decision, by)
+    if decision != "approved":
+        return ("The user declined this action, so nothing was changed. Do not retry it; "
+                "tell the user what you would have done."), True
+    # Minted over the server's normalized arguments: exactly what the person saw.
+    token = approval.mint(key, name, request["arguments"])
+    return await call_tool(session, name, arguments, meta={approval.META_FIELD: token})
+
+
+async def run_task(client, session, tools, task, model, effort, max_steps, as_of,
+                   approvals, key):
     """Run one task to completion, tracing every step. Returns the finished Tracer."""
     tracer = Tracer(task, model, effort, as_of, SYSTEM_PROMPT, tools, max_steps)
     messages = [{"role": "user", "content": task}]
@@ -116,7 +160,8 @@ async def run_task(client, session, tools, task, model, effort, max_steps, as_of
                     if block.type != "tool_use":
                         continue
                     t0 = time.monotonic()
-                    text, is_error = await call_tool(session, block.name, block.input)
+                    text, is_error = await run_tool(session, tracer, step, block.name,
+                                                    block.input, approvals, key)
                     ms = (time.monotonic() - t0) * 1000
                     tracer.tool_call(step, block.name, block.input, text, is_error, ms)
                     log(f"  [{step}] {block.name}({json.dumps(block.input)}) "
@@ -144,12 +189,15 @@ async def run_task(client, session, tools, task, model, effort, max_steps, as_of
     return tracer
 
 
-async def main(tasks, model, effort, max_steps):
+async def main(tasks, model, effort, max_steps, approvals):
     client = anthropic.AsyncAnthropic()
     # Freeze "today" for the whole run so the server and the trace agree on it.
     as_of = os.environ.get("JOBSEARCH_AS_OF") or date.today().isoformat()
+    # A fresh approval secret per run, shared only with the server we launch.
+    key = approval.new_key()
     params = StdioServerParameters(command=sys.executable, args=[str(HERE / "server.py")],
-                                   env={**os.environ, "JOBSEARCH_AS_OF": as_of})
+                                   env={**os.environ, "JOBSEARCH_AS_OF": as_of,
+                                        approval.KEY_ENV: key})
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -160,7 +208,8 @@ async def main(tasks, model, effort, max_steps):
 
             for i, task in enumerate(tasks, 1):
                 log(f"\n=== Task {i}/{len(tasks)}: {task}")
-                tr = await run_task(client, session, tools, task, model, effort, max_steps, as_of)
+                tr = await run_task(client, session, tools, task, model, effort, max_steps,
+                                    as_of, approvals, key)
                 print(f"\n--- Task {i} answer ({tr.outcome}) ---\n{tr.answer}")
                 log(f"  {tr.summary()}\n  trace: {tr.path.relative_to(HERE)}")
 
@@ -173,6 +222,9 @@ if __name__ == "__main__":
     ap.add_argument("--effort", default=DEFAULT_EFFORT,
                     choices=["low", "medium", "high", "xhigh", "max"])
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    ap.add_argument("--approvals", default="ask", choices=["ask", "deny", "approve"],
+                    help="how risky write tools are decided: ask a person (default; "
+                         "denies when there is no terminal), or deny/approve all")
     args = ap.parse_args()
 
     if not args.task and not args.demo:
@@ -181,4 +233,4 @@ if __name__ == "__main__":
         sys.exit("No ANTHROPIC_API_KEY found. Create one in the Claude Console and put "
                  "ANTHROPIC_API_KEY=... in a .env file next to agent.py.")
     asyncio.run(main(DEMO_TASKS if args.demo else [args.task],
-                     args.model, args.effort, args.max_steps))
+                     args.model, args.effort, args.max_steps, args.approvals))

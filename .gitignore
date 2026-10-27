@@ -9,3 +9,6 @@ traces/
 
 __pycache__/
 .DS_Store
+
+# write tools: local "sent" email (contains names)
+outbox/

@@ -43,7 +43,9 @@ CREATE TABLE companies (
     notes               TEXT
 );
 
-CREATE TABLE applications (
+-- Every application ever imported, soft-deleted ones included. Read code uses
+-- the `applications` view below, which hides deleted rows.
+CREATE TABLE application_records (
     id                  INTEGER PRIMARY KEY,
     company_id          INTEGER NOT NULL REFERENCES companies(id),
     title               TEXT NOT NULL,
@@ -64,8 +66,13 @@ CREATE TABLE applications (
     days_to_rejection   INTEGER,
     possible_duplicate  INTEGER NOT NULL DEFAULT 0,
     notes               TEXT,
-    sheet_row           INTEGER            -- row number in the Applications CSV
+    sheet_row           INTEGER,           -- row number in the Applications CSV
+    deleted_at          TEXT,              -- set by delete_application; row is kept
+    deleted_reason      TEXT
 );
+
+CREATE VIEW applications AS
+SELECT * FROM application_records WHERE deleted_at IS NULL;
 
 CREATE TABLE contacts (
     id              INTEGER PRIMARY KEY,
@@ -80,7 +87,7 @@ CREATE TABLE contacts (
 CREATE TABLE events (
     id              INTEGER PRIMARY KEY,
     company_id      INTEGER NOT NULL REFERENCES companies(id),
-    application_id  INTEGER REFERENCES applications(id),
+    application_id  INTEGER REFERENCES application_records(id),
     type            TEXT NOT NULL
         CHECK (type IN
                ('screening_questions','general_assessment','coding_assessment',
@@ -99,9 +106,29 @@ CREATE TABLE data_issues (
     detail      TEXT
 );
 
-CREATE INDEX idx_app_company ON applications(company_id);
-CREATE INDEX idx_app_status  ON applications(status);
-CREATE INDEX idx_app_date    ON applications(applied_date);
+-- Written only by the approval-gated write tools (writes.py).
+CREATE TABLE drafts (
+    id              INTEGER PRIMARY KEY,
+    company_id      INTEGER NOT NULL REFERENCES companies(id),
+    application_id  INTEGER REFERENCES application_records(id),
+    contact_name    TEXT NOT NULL,
+    subject         TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    sent_at         TEXT                   -- set by send_email (local outbox only)
+);
+
+CREATE TABLE write_log (
+    id          INTEGER PRIMARY KEY,
+    at          TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    arguments   TEXT NOT NULL,             -- JSON
+    result      TEXT NOT NULL              -- JSON
+);
+
+CREATE INDEX idx_app_company ON application_records(company_id);
+CREATE INDEX idx_app_status  ON application_records(status);
+CREATE INDEX idx_app_date    ON application_records(applied_date);
 CREATE INDEX idx_contacts_co ON contacts(company_id);
 CREATE INDEX idx_events_co   ON events(company_id);
 
@@ -552,7 +579,7 @@ class Builder:
             key = (name, title.lower(), location.lower(), iso(applied))
             dup = 1 if key in seen else 0
             cur = self.db.execute(
-                """INSERT INTO applications(company_id,title,req_id,location,applied_date,source,
+                """INSERT INTO application_records(company_id,title,req_id,location,applied_date,source,
                        recruiter_hunt,status,raw_status,response_bucket,raw_response_time,
                        rejected_date,days_to_rejection,possible_duplicate,notes,sheet_row)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -562,7 +589,7 @@ class Builder:
                  iso(rejected), days, dup, note or None, rownum))
             app_id = cur.lastrowid
             if dup:
-                self.db.execute("UPDATE applications SET possible_duplicate=1 WHERE id=?",
+                self.db.execute("UPDATE application_records SET possible_duplicate=1 WHERE id=?",
                                 (seen[key],))
                 self.issue("applications", rownum, "possible_duplicate",
                            f"{name} | {title} | {location} | {applied} also appears earlier")
