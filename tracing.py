@@ -53,10 +53,10 @@ def _jsonable(obj):
 # writer
 # --------------------------------------------------------------------------
 class Tracer:
-    def __init__(self, task, model, effort, as_of, system, tools, max_steps):
-        TRACE_DIR.mkdir(exist_ok=True)
+    def __init__(self, task, model, effort, as_of, system, tools, max_steps, path=None):
         self.run_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-        self.path = TRACE_DIR / f"{self.run_id}.jsonl"
+        self.path = Path(path) if path else TRACE_DIR / f"{self.run_id}.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._f = self.path.open("w", encoding="utf-8")
         self.model = model
         self.started = time.monotonic()

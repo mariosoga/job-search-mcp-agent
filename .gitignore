@@ -12,3 +12,6 @@ __pycache__/
 
 # write tools: local "sent" email (contains names)
 outbox/
+
+# eval runs: snapshot, results and traces hold personal data
+evals/results/

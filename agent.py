@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 
@@ -44,7 +45,9 @@ DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_EFFORT = "medium"
 DEFAULT_MAX_STEPS = 12
 # On a safety decline the API re-runs the request on a fallback model it picks.
+# Only some models accept this; others (e.g. claude-haiku-5-5) reject the parameter.
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 
 SYSTEM_PROMPT = """You answer questions about the user's own job search using the
 tools provided. They are the only source of truth: never state a fact that did not
@@ -121,10 +124,12 @@ async def run_tool(session, tracer, step, name, arguments, approvals, key):
 
 
 async def run_task(client, session, tools, task, model, effort, max_steps, as_of,
-                   approvals, key):
+                   approvals, key, trace_path=None):
     """Run one task to completion, tracing every step. Returns the finished Tracer."""
-    tracer = Tracer(task, model, effort, as_of, SYSTEM_PROMPT, tools, max_steps)
+    tracer = Tracer(task, model, effort, as_of, SYSTEM_PROMPT, tools, max_steps, trace_path)
     messages = [{"role": "user", "content": task}]
+    fallback = ({"betas": [FALLBACK_BETA], "fallbacks": "default"}
+                if model in FALLBACK_MODELS else {})
     # Stays "interrupted" only if something (e.g. Ctrl-C) stops the run mid-step.
     outcome, answer = "interrupted", None
 
@@ -139,8 +144,7 @@ async def run_task(client, session, tools, task, model, effort, max_steps, as_of
                     tools=tools,
                     messages=messages,
                     output_config={"effort": effort},
-                    betas=[FALLBACK_BETA],
-                    fallbacks="default",
+                    **fallback,
                 )
             except anthropic.APIStatusError as e:
                 outcome, answer = "errored", f"API error {e.status_code}: {e.message}"
@@ -189,29 +193,36 @@ async def run_task(client, session, tools, task, model, effort, max_steps, as_of
     return tracer
 
 
+@asynccontextmanager
+async def connect(as_of, key, env=None, errlog=sys.stderr):
+    """Launch server.py over stdio. Yields (session, tool definitions for the API).
+    `env` overrides the server's environment, e.g. JOBSEARCH_DB for a database copy;
+    `errlog` receives the server's log output."""
+    params = StdioServerParameters(command=sys.executable, args=[str(HERE / "server.py")],
+                                   env={**os.environ, "JOBSEARCH_AS_OF": as_of,
+                                        approval.KEY_ENV: key, **(env or {})})
+    async with stdio_client(params, errlog=errlog) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listed = (await session.list_tools()).tools
+            yield session, [{"name": t.name, "description": t.description or "",
+                             "input_schema": t.inputSchema} for t in listed]
+
+
 async def main(tasks, model, effort, max_steps, approvals):
     client = anthropic.AsyncAnthropic()
     # Freeze "today" for the whole run so the server and the trace agree on it.
     as_of = os.environ.get("JOBSEARCH_AS_OF") or date.today().isoformat()
     # A fresh approval secret per run, shared only with the server we launch.
     key = approval.new_key()
-    params = StdioServerParameters(command=sys.executable, args=[str(HERE / "server.py")],
-                                   env={**os.environ, "JOBSEARCH_AS_OF": as_of,
-                                        approval.KEY_ENV: key})
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            listed = (await session.list_tools()).tools
-            tools = [{"name": t.name, "description": t.description or "",
-                      "input_schema": t.inputSchema} for t in listed]
-            log(f"Connected: {len(tools)} tools, model {model}, effort {effort}, as_of {as_of}")
-
-            for i, task in enumerate(tasks, 1):
-                log(f"\n=== Task {i}/{len(tasks)}: {task}")
-                tr = await run_task(client, session, tools, task, model, effort, max_steps,
-                                    as_of, approvals, key)
-                print(f"\n--- Task {i} answer ({tr.outcome}) ---\n{tr.answer}")
-                log(f"  {tr.summary()}\n  trace: {tr.path.relative_to(HERE)}")
+    async with connect(as_of, key) as (session, tools):
+        log(f"Connected: {len(tools)} tools, model {model}, effort {effort}, as_of {as_of}")
+        for i, task in enumerate(tasks, 1):
+            log(f"\n=== Task {i}/{len(tasks)}: {task}")
+            tr = await run_task(client, session, tools, task, model, effort, max_steps,
+                                as_of, approvals, key)
+            print(f"\n--- Task {i} answer ({tr.outcome}) ---\n{tr.answer}")
+            log(f"  {tr.summary()}\n  trace: {tr.path.relative_to(HERE)}")
 
 
 if __name__ == "__main__":
