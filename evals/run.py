@@ -36,6 +36,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from contextlib import closing
 from pathlib import Path
 
 EVALS = Path(__file__).resolve().parent
@@ -182,7 +183,7 @@ async def run_case(client, t, rep, args, out_dir, sem):
             passed, results = grade(t, tr.answer, tr.outcome, records, run_db)
             # Keep the end state only when the run changed something; otherwise it equals
             # the snapshot. Lets --regrade re-score after a grader fix without re-running.
-            with sqlite3.connect(run_db) as c:
+            with closing(sqlite3.connect(run_db)) as c:
                 changed = c.execute("SELECT COUNT(*) FROM write_log").fetchone()[0]
             if changed:
                 (out_dir / "dbs").mkdir(exist_ok=True)

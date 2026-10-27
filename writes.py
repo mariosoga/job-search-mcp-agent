@@ -20,6 +20,7 @@ Like queries.py, nothing here raises on bad input: it returns {"error": ...}.
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
@@ -73,11 +74,21 @@ def needs_approval(tool):
     return TOOLS[tool][1] != "low"
 
 
+@contextmanager
 def connect_rw():
+    """`with connect_rw() as conn:` commits on success, rolls back on any exception,
+    and always closes."""
     conn = sqlite3.connect(queries.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _now():

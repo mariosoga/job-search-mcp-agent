@@ -15,6 +15,7 @@ Design rules that matter for the agent:
 """
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
@@ -35,11 +36,17 @@ APP_COLUMNS = """a.id AS application_id, c.name AS company, a.title, a.req_id, a
 # --------------------------------------------------------------------------
 # plumbing
 # --------------------------------------------------------------------------
+@contextmanager
 def connect():
+    """`with connect() as conn:` opens read-only and always closes. (A bare sqlite3
+    connection used as a context manager commits but never closes.)"""
     # as_uri() percent-encodes spaces, which matters for a folder named "Resume Projects"
     conn = sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def today():
