@@ -15,6 +15,7 @@ import sys
 from typing import Literal, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 import approval
@@ -25,7 +26,23 @@ logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("jobsearch-mcp")
 
-mcp = FastMCP("jobsearch")
+class StrictFastMCP(FastMCP):
+    """FastMCP silently drops arguments a tool does not declare, so a call like
+    find_stale_applications(offset=100) quietly returns page one again. Reject
+    unknown arguments instead, naming the ones the tool does accept."""
+
+    async def call_tool(self, name, arguments):
+        tool = self._tool_manager.get_tool(name)
+        if tool is not None:
+            allowed = set(tool.parameters.get("properties", {}))
+            unknown = sorted(set(arguments or {}) - allowed)
+            if unknown:
+                raise ToolError(f"{name} does not accept {unknown}; its arguments are "
+                                f"{sorted(allowed)}. Nothing was run.")
+        return await super().call_tool(name, arguments)
+
+
+mcp = StrictFastMCP("jobsearch")
 
 Status = Literal["applied", "responded", "assessment", "interviewing", "rejected", "closed"]
 OutreachStatus = Literal["messaged", "accepted", "replied", "asked_resume"]
@@ -100,13 +117,16 @@ def find_stale_applications(
     min_days: int = 21,
     require_accepted_contact: bool = False,
     limit: int = 25,
+    offset: int = 0,
 ) -> dict:
     """Find applications still at status 'applied' (no response) that were
     submitted at least min_days ago, oldest first. Each row includes
     accepted_contacts, the number of recruiters at that company who accepted,
     replied, or asked for my resume. Set require_accepted_contact=true to keep
-    only companies where I have such a contact (good follow-up candidates)."""
-    return queries.find_stale_applications(min_days, require_accepted_contact, limit)
+    only companies where I have such a contact (good follow-up candidates).
+    Results are capped at 100 per call; `total` is the full match count, so page
+    with `offset` if total > returned."""
+    return queries.find_stale_applications(min_days, require_accepted_contact, limit, offset)
 
 
 @mcp.tool()
@@ -184,7 +204,9 @@ def update_status(application_id: int, status: Status, ctx: Context,
                   note: Optional[str] = None) -> dict:
     """Change one application's status. Requires a person's approval, which the
     agent asks for automatically. If it is declined, nothing changes: do not
-    retry the same action."""
+    retry the same action. If the user's request covers more than one
+    application, do not call this yet: first tell them how many applications
+    would change (and which), and ask them to confirm."""
     return _write("update_status", {"application_id": application_id, "status": status,
                                     "note": note}, ctx)
 
@@ -200,7 +222,10 @@ def send_email(draft_id: int, ctx: Context) -> dict:
 @mcp.tool(annotations=RISKY)
 def delete_application(application_id: int, reason: str, ctx: Context) -> dict:
     """Hide one application from all searches (soft delete; the row is kept).
-    Requires a person's approval. One application per call; there is no bulk delete."""
+    Requires a person's approval. One application per call; there is no bulk delete.
+    If the user's request covers more than one application, do not call this yet:
+    first tell them how many applications would be hidden (and which), and ask
+    them to confirm."""
     return _write("delete_application", {"application_id": application_id,
                                          "reason": reason}, ctx)
 

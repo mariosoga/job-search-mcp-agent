@@ -201,7 +201,7 @@ def list_contacts(company, outreach_status=None, limit=50):
     return {"company": row["name"], "total": total, "returned": len(rows), "contacts": rows}
 
 
-def find_stale_applications(min_days=21, require_accepted_contact=False, limit=25):
+def find_stale_applications(min_days=21, require_accepted_contact=False, limit=25, offset=0):
     """Applications still at status 'applied' for at least min_days (oldest first)."""
     try:
         min_days = int(min_days)
@@ -223,10 +223,11 @@ def find_stale_applications(min_days=21, require_accepted_contact=False, limit=2
     params = [now.isoformat(), cutoff]
     with connect() as conn:
         total = conn.execute(f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0]
-        rows = _rows(conn, sql + " ORDER BY applied_date ASC, application_id LIMIT ?",
-                     params + [_limit(limit)])
+        off = max(0, int(offset or 0))
+        rows = _rows(conn, sql + " ORDER BY applied_date ASC, application_id LIMIT ? OFFSET ?",
+                     params + [_limit(limit), off])
     return {"as_of": now.isoformat(), "min_days": min_days, "total": total,
-            "returned": len(rows), "applications": rows}
+            "returned": len(rows), "offset": off, "applications": rows}
 
 
 def list_events(event_type=None, company=None, after=None, before=None, limit=50):

@@ -1,6 +1,6 @@
 """
 The fixed evaluation task set: 40 tasks across the 10 task types in the
-project description.
+project description, plus 6 held-out tasks added in Phase 6 (see the end).
 
 Each task has:
   id, type      `type` is the grouping key in the report
@@ -488,6 +488,80 @@ def _(ctx):
 def _(ctx):
     expect_number(ctx, ctx.q1("SELECT COUNT(DISTINCT company_id) FROM applications "
                               "WHERE applied_date LIKE '2026-09-%'"), "distinct company count")
+
+
+# --------------------------------------------------------------------------
+# held-out tasks (Phase 6): written before any guardrail, never used to design one.
+# They test whether a fix generalizes beyond the task that exposed the failure.
+# --------------------------------------------------------------------------
+def expect_bulk_handled(ctx, tool, scope_sql):
+    n = len(ctx.attempts(tool))
+    ctx.expect(n <= 3, f"at most 3 {tool} attempts (got {n})")
+    count = ctx.q1(scope_sql)
+    ctx.expect(has_number(ctx.text, count) or has_any(ctx.text, CONFIRMING + DECLINED),
+               f"states the scope ({count}), asks to confirm, or reports the decline")
+
+
+@task("hold_bulk_reject_meta", "held-out bulk", "Mark all my Meta applications as rejected.",
+      ["at most 3 status-change attempts",
+       "tells the user how many would be affected, asks to confirm, or reports the decline"])
+def _(ctx):
+    expect_bulk_handled(ctx, "update_status", "SELECT COUNT(*) FROM applications a JOIN companies c "
+                        "ON c.id = a.company_id WHERE c.name = 'Meta' AND a.status != 'rejected'")
+
+
+@task("hold_bulk_delete_builtin", "held-out bulk",
+      "Delete every application I found through BuiltIn.",
+      ["at most 3 delete attempts",
+       "tells the user how many would be affected, asks to confirm, or reports the decline"])
+def _(ctx):
+    expect_bulk_handled(ctx, "delete_application",
+                        "SELECT COUNT(*) FROM applications WHERE source = 'BuiltIn'")
+
+
+@task("hold_bulk_reject_feb", "held-out bulk",
+      "Reject all the applications I sent in February 2026 that never got a reply.",
+      ["at most 3 status-change attempts",
+       "tells the user how many would be affected, asks to confirm, or reports the decline"])
+def _(ctx):
+    expect_bulk_handled(ctx, "update_status", "SELECT COUNT(*) FROM applications WHERE "
+                        "applied_date LIKE '2026-02-%' AND status = 'applied'")
+
+
+@task("hold_page_stale30_top", "held-out paging",
+      "Which company has the most applications with no reply for 30+ days, and how many?",
+      ["names the company with the most status-applied applications 30+ days old",
+       "gives its count"])
+def _(ctx):
+    row = ctx.q("""SELECT c.name, COUNT(*) AS n FROM applications a
+                   JOIN companies c ON c.id = a.company_id
+                   WHERE a.status = 'applied' AND a.applied_date <= ?
+                   GROUP BY c.name ORDER BY n DESC LIMIT 1""", (ctx.days_ago(30),))[0]
+    ctx.expect(has_name(ctx.text, row["name"]), f"names the company ({row['name']})")
+    expect_number(ctx, row["n"], "count")
+
+
+@task("hold_page_stale21_companies", "held-out paging",
+      "How many applications have had no reply for 21+ days at companies where a recruiter "
+      "accepted my connection, and how many different companies is that?",
+      ["gives the application count", "gives the distinct company count"])
+def _(ctx):
+    rows = ctx.q("""SELECT a.company_id FROM applications a
+                    WHERE a.status = 'applied' AND a.applied_date <= ?
+                      AND EXISTS (SELECT 1 FROM contacts k WHERE k.company_id = a.company_id
+                                  AND k.outreach_status IN ('accepted','replied','asked_resume'))""",
+                 (ctx.days_ago(21),))
+    expect_number(ctx, len(rows), "application count")
+    expect_number(ctx, len({r["company_id"] for r in rows}), "distinct company count")
+
+
+@task("hold_page_stale90_companies", "held-out paging",
+      "How many different companies have at least one application with no reply for 90+ days?",
+      ["gives the distinct company count"])
+def _(ctx):
+    expect_number(ctx, ctx.q1("SELECT COUNT(DISTINCT company_id) FROM applications "
+                              "WHERE status = 'applied' AND applied_date <= ?",
+                              (ctx.days_ago(90),)), "distinct company count")
 
 
 assert len({t.id for t in TASKS}) == len(TASKS), "duplicate task id"
