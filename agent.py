@@ -12,6 +12,8 @@ visible and can be traced later:
   3. run any tool calls Claude asks for through the MCP client, return results
   4. repeat until Claude gives a final answer or the step limit is reached
 
+Every run, failed ones included, writes a trace to traces/ (see tracing.py).
+
 Needs ANTHROPIC_API_KEY, read from the environment or a gitignored .env file.
 """
 import argparse
@@ -20,12 +22,15 @@ import json
 import os
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+from tracing import Tracer
 
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
@@ -63,87 +68,101 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-async def run_task(client, session, tools, task, model, effort, max_steps):
-    """Run one task to completion. Returns a summary dict (Phase 3 adds full traces)."""
+async def call_tool(session, name, arguments):
+    """Run one MCP tool call. Returns (result_text, is_error); never raises."""
+    try:
+        result = await session.call_tool(name, arguments)
+    except Exception as e:  # server crashed or protocol error: still a result for the model
+        return f"Tool call failed: {type(e).__name__}: {e}", True
+    return tool_text(result), bool(result.isError)
+
+
+async def run_task(client, session, tools, task, model, effort, max_steps, as_of):
+    """Run one task to completion, tracing every step. Returns the finished Tracer."""
+    tracer = Tracer(task, model, effort, as_of, SYSTEM_PROMPT, tools, max_steps)
     messages = [{"role": "user", "content": task}]
-    tokens_in = tokens_out = tool_calls = 0
-    started = time.monotonic()
-    outcome, answer = "step_limit", None
+    # Stays "interrupted" only if something (e.g. Ctrl-C) stops the run mid-step.
+    outcome, answer = "interrupted", None
 
-    for step in range(1, max_steps + 1):
-        try:
-            response = await client.beta.messages.create(
-                model=model,
-                max_tokens=16000,
-                system=SYSTEM_PROMPT,
-                tools=tools,
-                messages=messages,
-                output_config={"effort": effort},
-                betas=[FALLBACK_BETA],
-                fallbacks="default",
-            )
-        except anthropic.APIStatusError as e:
-            outcome, answer = "errored", f"API error {e.status_code}: {e.message}"
+    try:
+        for step in range(1, max_steps + 1):
+            t0 = time.monotonic()
+            try:
+                response = await client.beta.messages.create(
+                    model=model,
+                    max_tokens=16000,
+                    system=SYSTEM_PROMPT,
+                    tools=tools,
+                    messages=messages,
+                    output_config={"effort": effort},
+                    betas=[FALLBACK_BETA],
+                    fallbacks="default",
+                )
+            except anthropic.APIStatusError as e:
+                outcome, answer = "errored", f"API error {e.status_code}: {e.message}"
+                tracer.model_error(step, answer, (time.monotonic() - t0) * 1000)
+                break
+            except anthropic.APIConnectionError as e:
+                outcome, answer = "errored", f"Network error: {e}"
+                tracer.model_error(step, answer, (time.monotonic() - t0) * 1000)
+                break
+            tracer.model_call(step, response, (time.monotonic() - t0) * 1000)
+            # Append the full content, not just text, so thinking blocks are preserved.
+            messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason == "tool_use":
+                results = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    t0 = time.monotonic()
+                    text, is_error = await call_tool(session, block.name, block.input)
+                    ms = (time.monotonic() - t0) * 1000
+                    tracer.tool_call(step, block.name, block.input, text, is_error, ms)
+                    log(f"  [{step}] {block.name}({json.dumps(block.input)}) "
+                        f"-> {'ERROR ' if is_error else ''}{len(text)} chars, {ms:.0f} ms")
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": text, "is_error": is_error})
+                # All results go back in one user message, so parallel calls stay parallel.
+                messages.append({"role": "user", "content": results})
+                continue
+
+            answer = "\n".join(b.text for b in response.content if b.type == "text")
+            if response.stop_reason == "end_turn":
+                outcome = "finished"
+            elif response.stop_reason == "refusal":
+                outcome = "refused"
+            else:  # max_tokens, pause_turn, etc.
+                outcome = response.stop_reason
             break
-        except anthropic.APIConnectionError as e:
-            outcome, answer = "errored", f"Network error: {e}"
-            break
-
-        tokens_in += response.usage.input_tokens
-        tokens_out += response.usage.output_tokens
-        # Append the full content, not just text, so thinking blocks are preserved.
-        messages.append({"role": "assistant", "content": response.content})
-
-        if response.stop_reason == "tool_use":
-            results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                tool_calls += 1
-                t0 = time.monotonic()
-                result = await session.call_tool(block.name, block.input)
-                ms = (time.monotonic() - t0) * 1000
-                text = tool_text(result)
-                log(f"  [{step}] {block.name}({json.dumps(block.input)}) "
-                    f"-> {'ERROR ' if result.isError else ''}{len(text)} chars, {ms:.0f} ms")
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": text, "is_error": bool(result.isError)})
-            # All results go back in one user message, so parallel calls stay parallel.
-            messages.append({"role": "user", "content": results})
-            continue
-
-        answer = "\n".join(b.text for b in response.content if b.type == "text")
-        if response.stop_reason == "end_turn":
-            outcome = "finished"
-        elif response.stop_reason == "refusal":
-            outcome = "refused"
-        else:  # max_tokens, pause_turn, etc.
-            outcome = response.stop_reason
-        break
-
-    return {"task": task, "outcome": outcome, "answer": answer, "steps": step,
-            "tool_calls": tool_calls, "input_tokens": tokens_in,
-            "output_tokens": tokens_out, "seconds": round(time.monotonic() - started, 1)}
+        else:
+            outcome = "step_limit"
+    except Exception as e:
+        outcome, answer = "errored", f"{type(e).__name__}: {e}"
+    finally:
+        tracer.end(outcome, answer)
+    return tracer
 
 
 async def main(tasks, model, effort, max_steps):
     client = anthropic.AsyncAnthropic()
-    params = StdioServerParameters(command=sys.executable,
-                                   args=[str(HERE / "server.py")], env=dict(os.environ))
+    # Freeze "today" for the whole run so the server and the trace agree on it.
+    as_of = os.environ.get("JOBSEARCH_AS_OF") or date.today().isoformat()
+    params = StdioServerParameters(command=sys.executable, args=[str(HERE / "server.py")],
+                                   env={**os.environ, "JOBSEARCH_AS_OF": as_of})
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             listed = (await session.list_tools()).tools
             tools = [{"name": t.name, "description": t.description or "",
                       "input_schema": t.inputSchema} for t in listed]
-            log(f"Connected: {len(tools)} tools, model {model}, effort {effort}")
+            log(f"Connected: {len(tools)} tools, model {model}, effort {effort}, as_of {as_of}")
 
             for i, task in enumerate(tasks, 1):
                 log(f"\n=== Task {i}/{len(tasks)}: {task}")
-                r = await run_task(client, session, tools, task, model, effort, max_steps)
-                print(f"\n--- Task {i} answer ({r['outcome']}) ---\n{r['answer']}")
-                log(f"  {r['outcome']}: {r['steps']} steps, {r['tool_calls']} tool calls, "
-                    f"{r['input_tokens']}+{r['output_tokens']} tokens, {r['seconds']} s")
+                tr = await run_task(client, session, tools, task, model, effort, max_steps, as_of)
+                print(f"\n--- Task {i} answer ({tr.outcome}) ---\n{tr.answer}")
+                log(f"  {tr.summary()}\n  trace: {tr.path.relative_to(HERE)}")
 
 
 if __name__ == "__main__":
